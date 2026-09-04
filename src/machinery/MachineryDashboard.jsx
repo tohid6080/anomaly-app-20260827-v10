@@ -9,9 +9,14 @@ import SyncStatusBadge from "../offline/SyncStatusBadge.jsx";
 import {
   MACHINE_TYPES, APPROVAL_STATUSES, MACHINERY_DOC_TYPES, approvalStatusMeta,
   loadMachineryListOfflineFirst, deleteMachineryDB, setMachineryApproval,
+  requestMachineryDeletion, approveMachineryDeletion, rejectMachineryDeletion,
   loadMachineryDocuments, daysUntil, EXPIRY_WARNING_DAYS,
 } from "./machineryApi.js";
 import MachineryForm from "./MachineryForm.jsx";
+import {
+  loadPendingGateItems, loadAssignedGateItems, loadCompanyStaffOptions, assignForReview,
+  submitReview as submitGateReview, approveGateItem, rejectGateItem, GATE_STATUS_LABELS,
+} from "../hseGateApi.js";
 
 const SORT_OPTIONS = [
   { value: "newest", label: "جدیدترین" },
@@ -43,6 +48,53 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
   const [editingDocs, setEditingDocs] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [reviewNoteDraft, setReviewNoteDraft] = useState("");
+
+  // گیت بازبینی سرپرست/مدیر HSE — ارجاع بررسی ماشین معرفی‌شده توسط
+  // پیمانکار به یک کارشناس، یا تأیید مستقیم توسط خودِ سرپرست. دقیقاً
+  // همان زیرساخت مشترک آنومالی/پرسنل.
+  const [gateMap, setGateMap] = useState({});
+  const [gateStaff, setGateStaff] = useState([]);
+  const [assigningGateId, setAssigningGateId] = useState(null);
+  const [assignGateTo, setAssignGateTo] = useState("");
+  const [reviewingGateId, setReviewingGateId] = useState(null);
+  const [gateReviewComment, setGateReviewComment] = useState("");
+  const [gateBusy, setGateBusy] = useState(null);
+  const [gateMessage, setGateMessage] = useState("");
+
+  const loadGateData = async () => {
+    if (isContractor) return;
+    const [pending, mine, staff] = await Promise.all([
+      isGatekeeper ? loadPendingGateItems("machineryManagement") : Promise.resolve([]),
+      loadAssignedGateItems(currentUser?.username).then((rows) => rows.filter((r) => r.moduleKey === "machineryManagement")),
+      isGatekeeper ? loadCompanyStaffOptions() : Promise.resolve([]),
+    ]);
+    const map = {};
+    [...pending, ...mine].forEach((it) => { map[it.recordId] = it; });
+    setGateMap(map);
+    setGateStaff(staff);
+  };
+  useEffect(() => { loadGateData(); }, [isContractor, isGatekeeper, currentUser?.username]);
+
+  const handleAssignForReview = async (m) => {
+    const gateItem = gateMap[m.id];
+    if (!gateItem || !assignGateTo) return;
+    setGateBusy(m.id); setGateMessage("");
+    const result = await assignForReview(gateItem.id, assignGateTo, currentUser?.name);
+    setGateBusy(null);
+    if (result?.__error) { setGateMessage(result.message); return; }
+    setAssigningGateId(null); setAssignGateTo("");
+    await loadGateData();
+  };
+  const handleSubmitGateReview = async (m) => {
+    const gateItem = gateMap[m.id];
+    if (!gateItem) return;
+    setGateBusy(m.id); setGateMessage("");
+    const result = await submitGateReview(gateItem.id, currentUser?.username, gateReviewComment);
+    setGateBusy(null);
+    if (result?.__error) { setGateMessage(result.message); return; }
+    setReviewingGateId(null); setGateReviewComment("");
+    await loadGateData();
+  };
   const [savingReview, setSavingReview] = useState(false);
   const [docsExpandedId, setDocsExpandedId] = useState(null);
   const [docsMap, setDocsMap] = useState({});
@@ -88,10 +140,35 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
   };
   const handleSaved = async () => { setShowForm(false); await load(); };
 
-  const handleDelete = async (id) => {
+  const handleDelete = async (m) => {
     if (readOnly) { alert("شما مجوز حذف را ندارید"); return; }
+    if (isContractor && m.approvalStatus === "approved") {
+      // پیمانکار نمی‌تواند ماشین تأییدشده را مستقیم حذف کند — این
+      // محدودیت سمت RLS هم اعمال شده، اینجا فقط تجربه‌ی کاربری بهتری
+      // برای همان محدودیت است. فقط می‌تواند درخواست حذف ثبت کند.
+      const note = prompt("این ماشین قبلاً توسط کارفرما تأیید شده است. علت درخواست حذف را بنویسید (اختیاری) — درخواست شما برای تأیید سرپرست/مدیر HSE ارسال می‌شود:");
+      if (note === null) return; // انصراف از prompt
+      const result = await requestMachineryDeletion(m.id, note, currentUser?.name);
+      if (result?.__error) { alert(result.message); return; }
+      alert("درخواست حذف ثبت شد و برای تأیید سرپرست/مدیر HSE ارسال شد.");
+      await load();
+      return;
+    }
     if (!confirm("این ماشین حذف شود؟")) return;
-    const result = await deleteMachineryDB(id);
+    const result = await deleteMachineryDB(m.id);
+    if (result?.__error) { alert(result.message); return; }
+    await load();
+  };
+  const handleApproveDeleteRequest = async (m) => {
+    if (!isGatekeeper) { alert("شما مجوز تأیید حذف را ندارید"); return; }
+    if (!confirm(`ماشین «${m.machineName} — ${m.plateNumber}» برای همیشه حذف شود؟`)) return;
+    const result = await approveMachineryDeletion(m.id);
+    if (result?.__error) { alert(result.message); return; }
+    await load();
+  };
+  const handleRejectDeleteRequest = async (m) => {
+    if (!isGatekeeper) { alert("شما مجوز رد درخواست حذف را ندارید"); return; }
+    const result = await rejectMachineryDeletion(m.id);
     if (result?.__error) { alert(result.message); return; }
     await load();
   };
@@ -127,9 +204,17 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
     }
     setSavingReview(true);
     await setMachineryApproval(m.id, status, reviewNoteDraft.trim());
+    // تصمیم مستقیم سرپرست (بدون عبور از گیت) هم مجاز است — ولی اگر یک
+    // رکورد گیت باز برای همین مورد وجود دارد، همان‌جا هم بسته می‌شود تا
+    // تاریخچه‌ی گیت با وضعیت واقعی ماشین ناهماهنگ نماند.
+    if (gateMap[m.id]) {
+      if (status === "approved") approveGateItem(gateMap[m.id].id, currentUser?.name).catch(() => {});
+      else rejectGateItem(gateMap[m.id].id, currentUser?.name, reviewNoteDraft.trim()).catch(() => {});
+    }
     setSavingReview(false);
     setExpandedId(null);
     await load();
+    await loadGateData();
   };
   const handleBulkApprove = async (ids) => {
     if (readOnly) { alert("شما مجوز تصمیم‌گیری را ندارید"); return; }
@@ -180,7 +265,7 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
         {isContractor && !readOnly && (
           <>
             <button type="button" style={styles.smallButton} onClick={() => startEdit(m)}>ویرایش</button>
-            <button type="button" style={{ ...styles.smallButton, background: THEME.danger }} onClick={() => handleDelete(m.id)}><Trash2 size={12} /></button>
+            <button type="button" style={{ ...styles.smallButton, background: THEME.danger }} onClick={() => handleDelete(m)}><Trash2 size={12} /></button>
           </>
         )}
         {isGatekeeper && !readOnly && m.approvalStatus === "pending" && (
@@ -265,9 +350,17 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
             key: "status", label: "وضعیت",
             render: (m) => {
               const sm = approvalStatusMeta(m.approvalStatus);
+              const gi = gateMap[m.id];
+              const assignedExpertName = gi?.status === "assigned_review" ? (gateStaff.find((s) => s.username === gi.assignedTo)?.name || gi.assignedTo) : null;
               return (
                 <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                   <StatusPill label={sm.label} color={sm.color} bg={sm.bg} />
+                  {assignedExpertName && (
+                    <span style={{ fontSize: 10.5, color: "#1d4ed8", fontWeight: 600 }}>ارجاع به کارشناس: {assignedExpertName}</span>
+                  )}
+                  {m.deleteRequestedBy && (
+                    <span style={{ fontSize: 10.5, color: THEME.danger, fontWeight: 600 }}>درخواست حذف در انتظار</span>
+                  )}
                   {m.syncStatus && m.syncStatus !== "synced" && <SyncStatusBadge status={m.syncStatus} onRetry={() => load()} />}
                 </div>
               );
@@ -277,6 +370,8 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
         renderRowActions={rowActions}
         renderCard={(m) => {
           const sm = approvalStatusMeta(m.approvalStatus);
+          const giCard = gateMap[m.id];
+          const assignedExpertNameCard = giCard?.status === "assigned_review" ? (gateStaff.find((s) => s.username === giCard.assignedTo)?.name || giCard.assignedTo) : null;
           const {
             insuranceDays, inspectionDays, healthCertDays, driverLicenseDays, backupDriverLicenseDays,
             insuranceWarn, inspectionWarn, healthCertWarn, driverLicenseWarn, backupDriverLicenseWarn, anyWarn,
@@ -291,9 +386,14 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
                     {MACHINE_TYPES.find((t) => t.value === m.machineType)?.label} {m.project && `· ${m.project}`}
                   </div>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <StatusPill label={sm.label} color={sm.color} bg={sm.bg} />
-                  {m.syncStatus && m.syncStatus !== "synced" && <SyncStatusBadge status={m.syncStatus} onRetry={() => load()} />}
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <StatusPill label={sm.label} color={sm.color} bg={sm.bg} />
+                    {m.syncStatus && m.syncStatus !== "synced" && <SyncStatusBadge status={m.syncStatus} onRetry={() => load()} />}
+                  </div>
+                  {assignedExpertNameCard && (
+                    <span style={{ fontSize: 10.5, color: "#1d4ed8", fontWeight: 600 }}>ارجاع به کارشناس: {assignedExpertNameCard}</span>
+                  )}
                 </div>
               </div>
 
@@ -355,6 +455,89 @@ export default function MachineryDashboard({ onBack, currentUser, role, initialA
                       </div>
                     );
                   })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {gateMap[expandedItem.id] && (gateMap[expandedItem.id].status === "pending_approval" || gateMap[expandedItem.id].status === "assigned_review" || gateMap[expandedItem.id].status === "reviewed") && (
+            <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 9, padding: 12, marginBottom: 10 }}>
+              <p style={{ fontSize: 12, fontWeight: 700, color: "#1d4ed8", margin: "0 0 8px" }}>
+                گیت بازبینی سرپرست/مدیر HSE — {GATE_STATUS_LABELS[gateMap[expandedItem.id].status] || gateMap[expandedItem.id].status}
+              </p>
+              {gateMap[expandedItem.id].status === "assigned_review" && (
+                <p style={{ fontSize: 12, color: "#1d4ed8", fontWeight: 600, margin: "0 0 8px" }}>
+                  ارجاع به کارشناس: {gateStaff.find((s) => s.username === gateMap[expandedItem.id].assignedTo)?.name || gateMap[expandedItem.id].assignedTo}
+                </p>
+              )}
+              {gateMap[expandedItem.id].reviewerComment && (
+                <p style={{ fontSize: 12, color: "#374151", margin: "0 0 8px", lineHeight: 1.8 }}>
+                  <b>نظر کارشناس:</b> {gateMap[expandedItem.id].reviewerComment}
+                </p>
+              )}
+              {gateMessage && <p style={styles.error}>{gateMessage}</p>}
+
+              {/* سمت سرپرست/مدیر HSE — ارجاع به کارشناس، یا تأیید مستقیم
+                  (که همان دکمه‌های «تأیید شد» پایین‌تر انجامش می‌دهند) */}
+              {isGatekeeper && gateMap[expandedItem.id].status === "pending_approval" && (
+                <div>
+                  {assigningGateId === expandedItem.id ? (
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <select style={{ ...styles.input, marginTop: 0, maxWidth: 220 }} value={assignGateTo} onChange={(e) => setAssignGateTo(e.target.value)} dir="rtl">
+                        <option value="">انتخاب کارشناس</option>
+                        {gateStaff.filter((s) => s.username !== currentUser?.username).map((s) => <option key={s.username} value={s.username}>{s.name}</option>)}
+                      </select>
+                      <button type="button" style={styles.smallButton} onClick={() => handleAssignForReview(expandedItem)} disabled={gateBusy === expandedItem.id || !assignGateTo}>ثبت ارجاع</button>
+                      <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => setAssigningGateId(null)}>انصراف</button>
+                    </div>
+                  ) : (
+                    <button type="button" style={styles.smallButton} onClick={() => { setAssigningGateId(expandedItem.id); setAssignGateTo(""); }} disabled={gateBusy === expandedItem.id}>
+                      ارجاع به کارشناس برای بررسی
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* سمت کارشناسی که این ماشین به او ارجاع شده — فقط نتیجه‌ی
+                  بررسی را برای سرپرست می‌فرستد، خودش نهایی تأیید نمی‌کند */}
+              {gateMap[expandedItem.id].status === "assigned_review" && gateMap[expandedItem.id].assignedTo === currentUser?.username && (
+                <div>
+                  {reviewingGateId !== expandedItem.id ? (
+                    <button type="button" style={styles.smallButton} onClick={() => { setReviewingGateId(expandedItem.id); setGateReviewComment(""); }} disabled={gateBusy === expandedItem.id}>
+                      ارسال نتیجه‌ی بررسی برای سرپرست/مدیر HSE
+                    </button>
+                  ) : (
+                    <div>
+                      <label style={styles.label}>نظر یا توضیح (اختیاری)</label>
+                      <textarea style={{ ...styles.input, minHeight: 50 }} value={gateReviewComment} onChange={(e) => setGateReviewComment(e.target.value)} dir="rtl" />
+                      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                        <button type="button" style={styles.smallButton} onClick={() => handleSubmitGateReview(expandedItem)} disabled={gateBusy === expandedItem.id}>ارسال</button>
+                        <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => setReviewingGateId(null)}>انصراف</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {expandedId === expandedItem.id && expandedItem.deleteRequestedBy && (
+            <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 9, padding: 12, marginBottom: 10 }}>
+              <p style={{ fontSize: 12, fontWeight: 700, color: THEME.danger, margin: "0 0 6px" }}>
+                درخواست حذف در انتظار تأیید سرپرست/مدیر HSE
+              </p>
+              <p style={{ fontSize: 11.5, color: "#374151", margin: "0 0 8px" }}>
+                درخواست‌دهنده: {expandedItem.deleteRequestedBy} — {toJalaliSafe(expandedItem.deleteRequestedAt)}
+                {expandedItem.deleteRequestNote && <> — علت: {expandedItem.deleteRequestNote}</>}
+              </p>
+              {isGatekeeper && !readOnly && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button type="button" style={{ ...styles.smallButton, background: THEME.danger }} onClick={() => handleApproveDeleteRequest(expandedItem)}>
+                    تأیید و حذف قطعی
+                  </button>
+                  <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => handleRejectDeleteRequest(expandedItem)}>
+                    رد درخواست حذف
+                  </button>
                 </div>
               )}
             </div>

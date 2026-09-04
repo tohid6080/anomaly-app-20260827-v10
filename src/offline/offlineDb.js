@@ -163,3 +163,47 @@ export async function deleteFile(fileId) {
 export function newLocalId(prefix = "local") {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 }
+
+// ============================================================
+// جداسازی کش محلی بین شرکت‌ها — رفع باگ واقعی: این فایل تا اینجا هیچ
+// شناخت از «شرکت» نداشت، فقط «ماژول» — یعنی روی یک دستگاه/مرورگر
+// مشترک، کش یک شرکت می‌توانست برای شرکت دیگری هم نمایش داده شود.
+// این تابع باید بلافاصله بعد از هر تغییر شرکت جاری (setCurrentCompanyId)
+// صدا زده شود؛ اگر شرکت واقعاً عوض شده باشد (یا برای اولین بار بعد از
+// این اصلاح اجرا شود — که یعنی کش قبلی ممکن است قبلاً آلوده شده باشد)،
+// هم کش خواندنی («records») هم صف نوشتن‌های آفلاین («sync_queue») کامل
+// پاک می‌شوند تا هیچ داده یا نوشتار در‌انتظاری از شرکت قبلی باقی نماند.
+// فایل‌های محلی («files») هم چون به رکوردهای همان شرکت وابسته‌اند، با
+// هم پاک می‌شوند.
+const COMPANY_SCOPE_KEY = "ihms_offline_cache_company_scope";
+
+export async function syncOfflineCacheCompanyScope(companyId) {
+  const normalized = companyId || null;
+  let previous;
+  try {
+    previous = localStorage.getItem(COMPANY_SCOPE_KEY);
+  } catch {
+    return; // localStorage در دسترس نیست (مثلاً حالت Private برخی مرورگرها) — بی‌خطر صرف‌نظر می‌کنیم
+  }
+  // previous === null یعنی این اولین اجرای این نسخه از کد است — چون کش
+  // قبلی ممکن است قبل از این اصلاح آلوده شده باشد، برای اطمینان کامل
+  // همان‌طور که با تعویض واقعی شرکت رفتار می‌کنیم: پاک‌سازی می‌کنیم.
+  if (previous === normalized) return; // همان شرکت قبلی — چیزی پاک نمی‌شود، نوشتارهای در‌انتظار حفظ می‌شوند
+
+  try {
+    const db = await openDb();
+    const t = tx(db, ["records", "sync_queue", "files"], "readwrite");
+    t.objectStore("records").clear();
+    t.objectStore("sync_queue").clear();
+    t.objectStore("files").clear();
+    await new Promise((resolve, reject) => { t.oncomplete = () => resolve(); t.onerror = () => reject(t.error); });
+  } catch {
+    // اگر پاک‌سازی خودش شکست بخورد، بی‌خطرتر از رها‌کردن کش آلوده نیست —
+    // ولی خطای IndexedDB نباید کل ورود کاربر را متوقف کند
+  }
+
+  try {
+    if (normalized) localStorage.setItem(COMPANY_SCOPE_KEY, normalized);
+    else localStorage.removeItem(COMPANY_SCOPE_KEY);
+  } catch { /* بی‌اهمیت */ }
+}

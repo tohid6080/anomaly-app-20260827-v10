@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Clock, ShieldCheck, UserX } from "lucide-react";
+import { Clock, ShieldCheck, UserX, Trash2 } from "lucide-react";
 import { styles, THEME } from "../shared.js";
 import { isoToJalaliDisplay, JalaliDateInput } from "./jalaliDate.jsx";
 import DocUploadField from "./DocUploadField.jsx";
@@ -9,10 +9,14 @@ import { loadRequiredTrainingsForJobTitle } from "../training/trainingApi.js";
 import AccidentPronenessSection from "./AccidentPronenessSection.jsx";
 import {
   DOC_TYPES, docStatusMeta, personnelStatusMeta,
-  loadPersonnelDocuments, upsertDocument, reviewDocumentDB, deleteDocumentDB,
+  loadPersonnelDocuments, upsertDocument, insertTrainingAttachment, reviewDocumentDB, deleteDocumentDB,
   updatePersonnelDB, progressPersonnelWorkflow, checkAndUpdateDeadlines,
   EMPLOYMENT_STATUS, employmentStatusMeta, setEmploymentStatus,
 } from "./personnelApi.js";
+import {
+  loadGateStatusForRecord, loadCompanyStaffOptions, assignForReview, submitReview,
+  approveGateItem, rejectGateItem, GATE_STATUS_LABELS,
+} from "../hseGateApi.js";
 
 /**
  * Personnel detail / review screen.
@@ -38,6 +42,63 @@ export default function PersonnelDetail({ personnel: initialPersonnel, role, cur
   const [requiredTrainings, setRequiredTrainings] = useState([]);
   const [trainingsLoading, setTrainingsLoading] = useState(true);
 
+  // گیت سرپرست/مدیر HSE — ارجاع بررسی این پرسنل به یک کارشناس، یا تأیید
+  // مستقیم توسط خودِ سرپرست. دقیقاً همان زیرساخت مشترک آنومالی.
+  const [gateItem, setGateItem] = useState(null);
+  const [gateStaff, setGateStaff] = useState([]);
+  const [assigningGate, setAssigningGate] = useState(false);
+  const [assignGateTo, setAssignGateTo] = useState("");
+  const [reviewingGate, setReviewingGate] = useState(false);
+  const [reviewComment, setReviewComment] = useState("");
+  const [gateRejectNote, setGateRejectNote] = useState("");
+  const [gateBusy, setGateBusy] = useState(false);
+  const [gateMessage, setGateMessage] = useState("");
+  const isGatekeeper = (currentUser?.role === "HSE_SUPERVISOR" || role === "ADMIN") && !readOnly;
+
+  const loadGate = () => {
+    if (role === "CONTRACTOR") return;
+    Promise.all([
+      loadGateStatusForRecord("personnelAccess", personnel.id),
+      isGatekeeper ? loadCompanyStaffOptions() : Promise.resolve([]),
+    ]).then(([item, staff]) => { setGateItem(item); setGateStaff(staff); });
+  };
+  useEffect(() => { loadGate(); }, [personnel.id]);
+
+  const handleAssignForReview = async () => {
+    if (!gateItem || !assignGateTo) return;
+    setGateBusy(true); setGateMessage("");
+    const result = await assignForReview(gateItem.id, assignGateTo, currentUser?.name);
+    setGateBusy(false);
+    if (result?.__error) { setGateMessage(result.message); return; }
+    setAssigningGate(false); setAssignGateTo("");
+    loadGate();
+  };
+  const handleSubmitGateReview = async () => {
+    if (!gateItem) return;
+    setGateBusy(true); setGateMessage("");
+    const result = await submitReview(gateItem.id, currentUser?.username, reviewComment);
+    setGateBusy(false);
+    if (result?.__error) { setGateMessage(result.message); return; }
+    setReviewingGate(false); setReviewComment("");
+    loadGate();
+  };
+  const handleApproveGate = async () => {
+    if (!gateItem) return;
+    setGateBusy(true); setGateMessage("");
+    const result = await approveGateItem(gateItem.id, currentUser?.name);
+    setGateBusy(false);
+    if (result?.__error) { setGateMessage(result.message); return; }
+    loadGate();
+  };
+  const handleRejectGate = async (note) => {
+    if (!gateItem) return;
+    setGateBusy(true); setGateMessage("");
+    const result = await rejectGateItem(gateItem.id, currentUser?.name, note);
+    setGateBusy(false);
+    if (result?.__error) { setGateMessage(result.message); return; }
+    loadGate();
+  };
+
   useEffect(() => {
     loadRequiredTrainingsForJobTitle(personnel.jobTitle).then((list) => {
       setRequiredTrainings(list);
@@ -51,7 +112,7 @@ export default function PersonnelDetail({ personnel: initialPersonnel, role, cur
   // role (prop) همیشه "EMPLOYER" است (حتی برای حساب سرپرست HSE — هر دو
   // در EmployerDashboard میزبانی می‌شوند)، مستقیم currentUser?.role چک
   // می‌شود که واقعاً نقش سیستمی کاربر جاری را نشان می‌دهد.
-  const isEmployer = (currentUser?.role === "HSE_SUPERVISOR" || role === "ADMIN") && !readOnly;
+  const isEmployer = (currentUser?.role === "HSE_SUPERVISOR" || role === "ADMIN" || (gateItem?.status === "assigned_review" && gateItem?.assignedTo === currentUser?.username)) && !readOnly;
   const isContractor = role === "CONTRACTOR" && !readOnly;
 
   const load = async () => {
@@ -101,6 +162,24 @@ export default function PersonnelDetail({ personnel: initialPersonnel, role, cur
   const handleDeleteDoc = async (doc) => {
     if (!isContractor) { alert("شما مجوز حذف مدرک را ندارید"); return; }
     if (!confirm("این مدرک حذف شود؟")) return;
+    await deleteDocumentDB(doc.id);
+    setDocuments(documents.filter((d) => d.id !== doc.id));
+  };
+
+  // پیوست‌های آموزش تخصصی — تا ۳ فایل هم‌زمان، افزودنی نه جایگزین‌کننده
+  const trainingAttachments = documents.filter((d) => d.docType === "specialized_safety_training");
+  const handleUploadTrainingAttachment = async (data, fileName, mimeType) => {
+    if (!isContractor) { alert("شما مجوز بارگذاری پیوست را ندارید"); return { __error: true, message: "no permission" }; }
+    const doc = await insertTrainingAttachment(personnel.id, data, fileName, mimeType, (currentUser?.name || currentUser?.username));
+    if (doc?.__error) return doc;
+    const newDocs = [...documents, doc];
+    const updatedP = await progressPersonnelWorkflow(personnel, newDocs, (currentUser?.name || currentUser?.username));
+    refreshAfterChange(updatedP, newDocs);
+    return doc;
+  };
+  const handleDeleteTrainingAttachment = async (doc) => {
+    if (!isContractor) { alert("شما مجوز حذف پیوست را ندارید"); return; }
+    if (!confirm("این پیوست حذف شود؟")) return;
     await deleteDocumentDB(doc.id);
     setDocuments(documents.filter((d) => d.id !== doc.id));
   };
@@ -156,6 +235,79 @@ export default function PersonnelDetail({ personnel: initialPersonnel, role, cur
         </div>
       </div>
 
+      {gateItem && (gateItem.status === "pending_approval" || gateItem.status === "assigned_review" || gateItem.status === "reviewed") && (
+        <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 9, padding: 14, marginBottom: 14 }}>
+          <p style={{ fontSize: 12, fontWeight: 700, color: "#1d4ed8", margin: "0 0 8px" }}>
+            گیت بازبینی سرپرست/مدیر HSE — {GATE_STATUS_LABELS[gateItem.status] || gateItem.status}
+          </p>
+          {gateItem.reviewerComment && (
+            <p style={{ fontSize: 12, color: "#374151", margin: "0 0 8px", lineHeight: 1.8 }}>
+              <b>نظر کارشناس:</b> {gateItem.reviewerComment}
+            </p>
+          )}
+          {gateMessage && <p style={styles.error}>{gateMessage}</p>}
+
+          {/* سمت سرپرست/مدیر HSE */}
+          {isGatekeeper && (gateItem.status === "pending_approval" || gateItem.status === "reviewed") && (
+            <div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                <button type="button" style={{ ...styles.smallButton, background: "#166534" }} onClick={handleApproveGate} disabled={gateBusy}>
+                  تأیید بررسی اولیه
+                </button>
+                {gateItem.status === "pending_approval" && (
+                  <button type="button" style={styles.smallButton} onClick={() => { setAssigningGate(true); setAssignGateTo(""); }} disabled={gateBusy}>
+                    ارجاع به کارشناس برای بررسی
+                  </button>
+                )}
+                <button type="button" style={{ ...styles.smallButton, background: THEME.danger }} onClick={() => setShowRejectFor("__gate__")} disabled={gateBusy}>
+                  رد
+                </button>
+              </div>
+              {assigningGate && (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <select style={{ ...styles.input, marginTop: 0, maxWidth: 220 }} value={assignGateTo} onChange={(e) => setAssignGateTo(e.target.value)} dir="rtl">
+                    <option value="">انتخاب کارشناس</option>
+                    {gateStaff.filter((s) => s.username !== currentUser?.username).map((s) => <option key={s.username} value={s.username}>{s.name}</option>)}
+                  </select>
+                  <button type="button" style={styles.smallButton} onClick={handleAssignForReview} disabled={gateBusy || !assignGateTo}>ثبت ارجاع</button>
+                  <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => setAssigningGate(false)}>انصراف</button>
+                </div>
+              )}
+              {showRejectFor === "__gate__" && (
+                <div style={{ marginTop: 8 }}>
+                  <label style={styles.label}>دلیل رد (اختیاری)</label>
+                  <textarea style={{ ...styles.input, minHeight: 50 }} value={gateRejectNote} onChange={(e) => setGateRejectNote(e.target.value)} dir="rtl" />
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button type="button" style={{ ...styles.smallButton, background: THEME.danger }} onClick={() => { handleRejectGate(gateRejectNote); setShowRejectFor(null); setGateRejectNote(""); }} disabled={gateBusy}>ثبت رد</button>
+                    <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => setShowRejectFor(null)}>انصراف</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* سمت کارشناسی که این پرسنل به او ارجاع شده */}
+          {gateItem.status === "assigned_review" && gateItem.assignedTo === currentUser?.username && (
+            <div>
+              {!reviewingGate ? (
+                <button type="button" style={styles.smallButton} onClick={() => { setReviewingGate(true); setReviewComment(""); }} disabled={gateBusy}>
+                  ارسال نتیجه‌ی بررسی برای سرپرست/مدیر HSE
+                </button>
+              ) : (
+                <div>
+                  <label style={styles.label}>نظر یا توضیح (اختیاری)</label>
+                  <textarea style={{ ...styles.input, minHeight: 50 }} value={reviewComment} onChange={(e) => setReviewComment(e.target.value)} dir="rtl" />
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button type="button" style={styles.smallButton} onClick={handleSubmitGateReview} disabled={gateBusy}>ارسال</button>
+                    <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => setReviewingGate(false)}>انصراف</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       <div style={{ ...styles.card, width: "auto" }}>
         <h3 style={{ fontSize: 14, color: THEME.navy, margin: "0 0 8px", fontWeight: 700 }}>آموزش‌های تخصصی موردنیاز (بر اساس عنوان شغلی)</h3>
         {trainingsLoading && <p style={{ fontSize: 12, color: THEME.text3 }}>در حال بررسی...</p>}
@@ -168,6 +320,39 @@ export default function PersonnelDetail({ personnel: initialPersonnel, role, cur
               <span key={t.id} style={{ ...styles.badge, background: "#e3f5f4", color: THEME.tealDeep }} title={t.description || ""}>{t.title}</span>
             ))}
           </div>
+        )}
+
+        <h4 style={{ fontSize: 12.5, color: THEME.navy, margin: "16px 0 8px", fontWeight: 700, borderTop: `1px solid ${THEME.border}`, paddingTop: 12 }}>
+          پیوست‌های فرم آموزش ایمنی تخصصی ({trainingAttachments.length.toLocaleString("fa-IR")} از ۳)
+        </h4>
+        {trainingAttachments.map((doc) => (
+          <div key={doc.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", background: THEME.bg, borderRadius: 8, marginBottom: 6 }}>
+            <button type="button" onClick={() => setViewerSrc(doc.fileData)} style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 12.5, color: THEME.navy, textAlign: "start" }}>
+              {doc.fileName || "پیوست"}
+            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {docStatusMeta && (
+                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 999, background: docStatusMeta(doc.status).bg, color: docStatusMeta(doc.status).color, fontWeight: 600 }}>
+                  {docStatusMeta(doc.status).label}
+                </span>
+              )}
+              {isContractor && (
+                <button type="button" onClick={() => handleDeleteTrainingAttachment(doc)} style={{ background: "none", border: "none", cursor: "pointer", color: THEME.danger }}>
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+        {isContractor && trainingAttachments.length < 3 && (
+          <DocUploadField
+            existingDoc={null}
+            onConfirm={handleUploadTrainingAttachment}
+            onView={setViewerSrc}
+          />
+        )}
+        {!isContractor && trainingAttachments.length === 0 && (
+          <p style={{ fontSize: 11.5, color: THEME.text3, margin: 0 }}>هنوز پیوستی بارگذاری نشده</p>
         )}
       </div>
 

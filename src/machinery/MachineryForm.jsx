@@ -4,6 +4,7 @@ import { styles, THEME } from "../shared.js";
 import { JalaliDateInput } from "../personnel/jalaliDate.jsx";
 import DocUploadField from "../personnel/DocUploadField.jsx";
 import DocumentViewerModal from "../personnel/DocumentViewerModal.jsx";
+import { submitToGate } from "../hseGateApi.js";
 import {
   MACHINE_TYPES, OWNERSHIP_STATUSES, LICENSE_TYPES, TRAFFIC_STATUSES, MACHINERY_DOC_TYPES,
   insertMachinery, updateMachineryInfo, submitMachineryForReview,
@@ -112,6 +113,12 @@ export default function MachineryForm({ existingMachinery, existingDocuments, cu
     const result = await submitMachineryForReview(machinery.id, record, Object.keys(docs));
     setSubmitting(false);
     if (result?.__error) { setError(result.message); return; }
+    if (currentUser?.role === "CONTRACTOR") {
+      submitToGate({
+        moduleKey: "machineryManagement", recordId: machinery.id,
+        recordLabel: `${machineName.trim()} — ${plateNumber.trim()}`, direction: "contractor_to_employer",
+      }, currentUser?.name).catch(() => {});
+    }
     onSaved && onSaved(result);
   };
 

@@ -53,6 +53,7 @@ export default function ProactiveIndicatorsDashboard({ onBack, currentUser, role
       <ResultsList
         indicatorKey={activeIndicatorKey}
         indicatorName={indicators.find((i) => i.key === activeIndicatorKey)?.name || ""}
+        currentUser={currentUser}
         onBack={() => setView("list")}
       />
     );
@@ -102,7 +103,7 @@ export default function ProactiveIndicatorsDashboard({ onBack, currentUser, role
 }
 
 // ---------- نتایج استعداد حادثه‌پذیری — جدول شخص‌محور (بدون تغییر) ----------
-function ResultsList({ indicatorKey, indicatorName, onBack }) {
+function ResultsList({ indicatorKey, indicatorName, currentUser, onBack }) {
   const [rows, setRows] = useState(null);
   const [caByAssessment, setCaByAssessment] = useState({});
 
@@ -131,18 +132,21 @@ function ResultsList({ indicatorKey, indicatorName, onBack }) {
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
             <thead>
               <tr style={{ borderBottom: `1.5px solid ${THEME.border}`, color: THEME.text3 }}>
+                <th style={{ textAlign: "right", padding: "8px" }}>شرکت</th>
                 <th style={{ textAlign: "right", padding: "8px" }}>پرسنل</th>
                 <th style={{ textAlign: "center", padding: "8px" }}>شغل</th>
                 <th style={{ textAlign: "center", padding: "8px" }}>تاریخ</th>
                 <th style={{ textAlign: "center", padding: "8px" }}>ارزیاب</th>
                 <th style={{ textAlign: "center", padding: "8px" }}>امتیاز نهایی</th>
                 <th style={{ textAlign: "center", padding: "8px" }}>سطح</th>
+                <th style={{ textAlign: "center", padding: "8px" }}>وضعیت تأیید</th>
                 <th style={{ textAlign: "center", padding: "8px" }}>اقدام اصلاحی</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((r) => (
                 <tr key={r.id} style={{ borderBottom: `1px solid ${THEME.border}` }}>
+                  <td style={{ padding: "8px", fontWeight: 600 }}>{currentUser?.companyName || "—"}</td>
                   <td style={{ padding: "8px", fontWeight: 600 }}>{r.personnelName}</td>
                   <td style={{ padding: "8px", textAlign: "center" }}>{r.jobTitle}</td>
                   <td style={{ padding: "8px", textAlign: "center" }}>{toJalaliSafe(r.assessmentDate)}</td>
@@ -153,6 +157,11 @@ function ResultsList({ indicatorKey, indicatorName, onBack }) {
                       const lv = accidentPronenessLevel(r.finalScore);
                       return <span style={{ fontSize: 10.5, padding: "3px 10px", borderRadius: 999, background: lv.bg, color: lv.color, fontWeight: 700 }}>{lv.level}</span>;
                     })() : "—"}
+                  </td>
+                  <td style={{ padding: "8px", textAlign: "center" }}>
+                    <span style={{ fontSize: 10.5, padding: "3px 10px", borderRadius: 999, background: r.status === "completed" ? "#dcfce7" : "#fef3c7", color: r.status === "completed" ? "#166534" : "#b45309", fontWeight: 600 }}>
+                      {r.status === "completed" ? "تکمیل‌شده و ارسال‌شده برای کارفرما" : (r.status || "—")}
+                    </span>
                   </td>
                   <td style={{ padding: "8px", textAlign: "center" }}>
                     {caByAssessment[r.id] ? (

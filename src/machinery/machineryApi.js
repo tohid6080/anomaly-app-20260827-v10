@@ -89,6 +89,9 @@ function machineryFromRow(r) {
     trafficStatus: r.traffic_status || "active",
     approvalStatus: r.approval_status || "pending",
     reviewNote: r.review_note || "",
+    deleteRequestedBy: r.delete_requested_by || "",
+    deleteRequestedAt: r.delete_requested_at || "",
+    deleteRequestNote: r.delete_request_note || "",
     createdBy: r.created_by || "",
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -204,6 +207,32 @@ export async function deleteMachineryDB(id) {
   const result = await offlineWrite({ module: "machinery", table: "machinery", action: "delete", id, payload: {} });
   if (!result.ok) return { __error: true, message: result.error || "خطا در حذف" };
   return { ok: true };
+}
+
+// ---------- درخواست حذف برای ماشین‌آلات تأییدشده (مورد ۶) ----------
+// طبق سیاست تأییدشده: پیمانکار نمی‌تواند مستقیم ماشین تأییدشده را حذف
+// کند (این محدودیت سمت RLS هم اعمال شده، نه فقط اینجا) — فقط می‌تواند
+// درخواست بدهد؛ سرپرست/مدیر HSE یا ادمین تأیید (حذف واقعی) یا رد
+// (پاک‌کردن درخواست) می‌کند.
+export async function requestMachineryDeletion(id, note, requestedBy) {
+  const payload = { delete_requested_by: requestedBy || "", delete_requested_at: new Date().toISOString(), delete_request_note: note || "" };
+  const result = await offlineWrite({ module: "machinery", table: "machinery", action: "update", id, payload });
+  if (!result.ok) return { __error: true, message: result.error || "خطا در ثبت درخواست حذف" };
+  return { ...machineryFromRow(result.record), syncStatus: result.offline ? "pending" : "synced" };
+}
+
+// تأیید درخواست حذف — همان حذف واقعی را انجام می‌دهد (فقط توسط
+// سرپرست/مدیر HSE یا ادمین قابل‌اجراست؛ RLS هم همین را تضمین می‌کند)
+export async function approveMachineryDeletion(id) {
+  return deleteMachineryDB(id);
+}
+
+// رد درخواست حذف — ماشین باقی می‌ماند، فقط علائم درخواست پاک می‌شود
+export async function rejectMachineryDeletion(id) {
+  const payload = { delete_requested_by: null, delete_requested_at: null, delete_request_note: null };
+  const result = await offlineWrite({ module: "machinery", table: "machinery", action: "update", id, payload });
+  if (!result.ok) return { __error: true, message: result.error || "خطا در رد درخواست حذف" };
+  return { ...machineryFromRow(result.record), syncStatus: result.offline ? "pending" : "synced" };
 }
 
 // تصمیم کارفرما — approved | needs_correction | rejected

@@ -5,6 +5,7 @@ import { JalaliDateInput } from "./jalaliDate.jsx";
 import DocUploadField from "./DocUploadField.jsx";
 import DocumentViewerModal from "./DocumentViewerModal.jsx";
 import { insertPersonnel, updatePersonnelDB, upsertDocument, loadContractorOptions, isSpecialJob } from "./personnelApi.js";
+import { submitToGate } from "../hseGateApi.js";
 
 /**
  * Phase 2.2 — Personnel registration form.
@@ -17,13 +18,7 @@ import { insertPersonnel, updatePersonnelDB, upsertDocument, loadContractorOptio
 
 // اعتبارسنجی کد ملی ایران (الگوریتم استاندارد رقم کنترلی)
 function isValidNationalCode(code) {
-  if (!/^\d{10}$/.test(code)) return false;
-  if (/^(\d)\1{9}$/.test(code)) return false; // همه ارقام یکسان، نامعتبر
-  const check = parseInt(code[9], 10);
-  let sum = 0;
-  for (let i = 0; i < 9; i++) sum += parseInt(code[i], 10) * (10 - i);
-  const remainder = sum % 11;
-  return (remainder < 2 && check === remainder) || (remainder >= 2 && check === 11 - remainder);
+  return /^\d{10}$/.test(code);
 }
 function isValidMobile(phone) {
   return /^09\d{9}$/.test((phone || "").trim());
@@ -51,8 +46,16 @@ export default function PersonnelForm({ onBack, onSaved, currentUser }) {
 
   useEffect(() => {
     (async () => {
-      setContractors(await loadContractorOptions());
+      const list = await loadContractorOptions();
+      setContractors(list);
       setLoadingContractors(false);
+      // اگر خودِ پیمانکار در حال ثبت پرسنل است، شرکت پیمانکار باید
+      // خودکار و بدون امکان انتخاب، همان حساب کاربری واردشده باشد —
+      // نه یک فهرست آزاد از همه‌ی پیمانکاران شرکت. این فرم فقط برای
+      // ایجاد رکورد جدید است (بدون حالت ویرایش)، پس همیشه امن است.
+      if (currentUser?.role === "CONTRACTOR") {
+        setContractorId(currentUser.id);
+      }
     })();
   }, []);
 
@@ -111,6 +114,13 @@ export default function PersonnelForm({ onBack, onSaved, currentUser }) {
       await updatePersonnelDB(inserted.id, { occHealthPath }, currentUser?.name || currentUser?.username);
     }
 
+    if (currentUser?.role === "CONTRACTOR") {
+      submitToGate({
+        moduleKey: "personnelAccess", recordId: inserted.id,
+        recordLabel: `${fullName.trim()} — ${jobTitle.trim()}`, direction: "contractor_to_employer",
+      }, currentUser?.name).catch(() => {});
+    }
+
     setSaving(false);
     onSaved ? onSaved(inserted) : onBack && onBack();
   };
@@ -133,7 +143,9 @@ export default function PersonnelForm({ onBack, onSaved, currentUser }) {
         {errors.nationalCode && <p style={styles.error}>{errors.nationalCode}</p>}
 
         <label style={styles.label}>شرکت پیمانکار</label>
-        {loadingContractors ? (
+        {currentUser?.role === "CONTRACTOR" ? (
+          <input style={{ ...styles.input, background: THEME.bg, color: THEME.text3 }} value={currentUser?.name || ""} disabled dir="rtl" />
+        ) : loadingContractors ? (
           <p style={{ fontSize: 12.5, color: THEME.text3 }}>در حال بارگذاری لیست پیمانکاران...</p>
         ) : (
           <select style={styles.input} value={contractorId} onChange={(e) => setContractorId(e.target.value)} dir="rtl">

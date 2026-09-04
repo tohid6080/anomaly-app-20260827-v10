@@ -58,7 +58,7 @@ import MachineryDashboard from "./machinery/MachineryDashboard.jsx";
 import { loadMachineryListOfflineFirst } from "./machinery/machineryApi.js";
 import ScaffoldDashboard from "./scaffold/ScaffoldDashboard.jsx";
 import ScaffoldTagCodeManager from "./scaffold/ScaffoldTagCodeManager.jsx";
-import { isOnline } from "./offline/networkStatus.js";
+import { syncOfflineCacheCompanyScope } from "./offline/offlineDb.js";
 import { getRecordsByModule, putRecord, getQueue } from "./offline/offlineDb.js";
 import SyncStatusBadge from "./offline/SyncStatusBadge.jsx";
 import { retryItemNow } from "./offline/syncEngine.js";
@@ -1038,6 +1038,7 @@ function LoginScreen({ onLogin }) {
       setError("");
       setWarning("");
       setCurrentCompanyId(user.companyId);
+      await syncOfflineCacheCompanyScope(user.companyId);
       trackLogin(user);
       if (user.preferredLanguage) setLang(user.preferredLanguage);
       // توکن نشست از قبل، داخل خودِ attemptCredentialLogin (از طریق
@@ -1281,6 +1282,7 @@ function BiometricGateScreen({ currentUser, onUnlocked, onFallbackToPassword }) 
     setChecking(false);
     if (user) {
       setCurrentCompanyId(user.companyId);
+      await syncOfflineCacheCompanyScope(user.companyId);
       trackLogin(user);
       onUnlocked(user);
     } else {
@@ -1425,6 +1427,8 @@ function ProfileView({ onBack, currentUser, roleLabel }) {
   const [bioBusy, setBioBusy] = useState(false);
   const [bioError, setBioError] = useState("");
   const [bioSupported, setBioSupported] = useState(true);
+  const [bioAskingPassword, setBioAskingPassword] = useState(false);
+  const [bioPasswordInput, setBioPasswordInput] = useState("");
 
   useEffect(() => {
     if (currentUser?.role === "CONTRACTOR") {
@@ -1461,15 +1465,38 @@ function ProfileView({ onBack, currentUser, roleLabel }) {
 
   const handleToggleBiometric = async () => {
     setBioError("");
-    setBioBusy(true);
     if (bioEnabled) {
+      setBioBusy(true);
       await disableBiometricLogin();
       setBioEnabled(false);
       setBioBusy(false);
       return;
     }
-    const result = await enableBiometricLogin(currentUser?.username, currentUser?.password);
+    // برای فعال‌سازی، رمز عبور فعلی لازم است (تا در Keystore امن دستگاه
+    // ذخیره شود) — چون currentUser هیچ‌وقت رمز عبور را حمل نمی‌کند (به‌درستی،
+    // برای امنیت)، اینجا از کاربر دوباره خواسته می‌شود، دقیقاً مثل بیشتر
+    // اپ‌های واقعی («برای فعال‌سازی Face ID رمز را دوباره وارد کنید»).
+    setBioAskingPassword(true);
+    setBioPasswordInput("");
+  };
+
+  const handleConfirmBiometricPassword = async () => {
+    if (!bioPasswordInput) return;
+    setBioError("");
+    setBioBusy(true);
+    // رمز واردشده از همان مسیر واقعی ورود تأیید می‌شود — نه یک بررسی موازی
+    // و جدا — تا مطمئن شویم دقیقاً همان چیزی که در Keystore ذخیره می‌شود،
+    // برای ورود واقعی هم کار می‌کند.
+    const verify = await attemptCredentialLogin(currentUser?.username, bioPasswordInput);
+    if (!verify?.user) {
+      setBioBusy(false);
+      setBioError("رمز عبور واردشده صحیح نیست.");
+      return;
+    }
+    const result = await enableBiometricLogin(currentUser?.username, bioPasswordInput);
     setBioBusy(false);
+    setBioAskingPassword(false);
+    setBioPasswordInput("");
     if (result?.__error) { setBioError(result.message); return; }
     setBioEnabled(true);
   };
@@ -1541,6 +1568,24 @@ function ProfileView({ onBack, currentUser, roleLabel }) {
               }} />
             </button>
           </div>
+          {bioAskingPassword && (
+            <div style={{ marginTop: 12, background: THEME.bg, borderRadius: 9, padding: 12 }}>
+              <label style={styles.label}>برای فعال‌سازی، رمز عبور فعلی خود را دوباره وارد کنید</label>
+              <input
+                type="password" style={styles.input} value={bioPasswordInput}
+                onChange={(e) => setBioPasswordInput(e.target.value)} dir="ltr" autoFocus
+                onKeyDown={(e) => { if (e.key === "Enter") handleConfirmBiometricPassword(); }}
+              />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button type="button" style={styles.smallButton} onClick={handleConfirmBiometricPassword} disabled={bioBusy || !bioPasswordInput}>
+                  {bioBusy ? "در حال تأیید..." : "تأیید و فعال‌سازی"}
+                </button>
+                <button type="button" style={{ ...styles.smallButton, background: THEME.text3 }} onClick={() => { setBioAskingPassword(false); setBioPasswordInput(""); setBioError(""); }}>
+                  انصراف
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {currentUser?.role === "ADMIN" && <ChangePasswordSection />}
@@ -2012,7 +2057,9 @@ function AnomalyForm({ onBack, currentUser, onSaved }) {
       }
     }
     setSaving(true);
-    const existing = await loadAnomaliesOfflineFirst();
+    setError("");
+    try {
+      const existing = await loadAnomaliesOfflineFirst();
     const record = {
       id: uid("anomaly"),
       trackingNumber: trackingNumber.trim() || `A-${String(existing.length + 1).padStart(4, "0")}`,
@@ -2040,7 +2087,6 @@ function AnomalyForm({ onBack, currentUser, onSaved }) {
       id: record.id, payload: anomalyRecordToDb(record),
     });
     if (!result.ok) {
-      setSaving(false);
       setError(`خطا در ذخیره‌سازی: ${result?.message || "نامشخص"}`);
       return;
     }
@@ -2091,8 +2137,17 @@ function AnomalyForm({ onBack, currentUser, onSaved }) {
         recordLabel: `${record.trackingNumber} — ${record.area}`, direction: "employer_to_contractor",
       }, currentUser?.name).catch(() => {});
     }
-    setSaving(false);
     onSaved ? onSaved() : onBack && onBack();
+    } catch (e) {
+      // رفع باگ واقعی گزارش‌شده: قبلاً اگه هر خطای غیرمنتظره‌ای اینجا رخ
+      // می‌داد، دکمه برای همیشه روی «در حال ثبت...» می‌موند، بدون هیچ
+      // پیامی — چون setSaving(false) هیچ‌وقت اجرا نمی‌شد. الان حداقل پیام
+      // واقعی خطا نشون داده می‌شه تا اگه دوباره رخ بده، دقیق مشخص بشه چرا.
+      console.error("خطای غیرمنتظره در ثبت آنومالی:", e);
+      setError(`خطای غیرمنتظره: ${e?.message || "نامشخص"} — لطفاً دوباره تلاش کنید یا این پیام را به پشتیبانی گزارش دهید.`);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -2537,6 +2592,18 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
     const patch = { status: "pending_review", contractorAction: actionText.trim(), photoCount: newPhotoCount };
     await offlineWrite({ module: "anomalies", table: "anomalies", action: "update", id: a.id, payload: anomalyPatchToDb(patch) });
     setAnomalies(anomalies.map((x) => (x.id === a.id ? { ...x, ...patch, syncStatus: isOnline() ? "synced" : "pending" } : x)));
+    // ورود به گیت دوم — بازبینی داخلی کارفرما قبل از تأیید نهایی. طبق
+    // خواسته‌ی صریح، سرپرست/مدیر HSE الان می‌تواند این مورد را به یک
+    // کارشناس ارجاع بدهد یا خودش مستقیم تأیید کند؛ چون رابط کاربری گیت
+    // کاملاً عمومی ساخته شده (بدون فرض جهت خاص)، همان دکمه‌های موجود
+    // ارجاع/بررسی/تأیید خودکار برای این مورد هم کار می‌کنند.
+    submitToGate({
+      moduleKey: "anomalyReport", recordId: a.id,
+      recordLabel: `${a.trackingNumber} — ${a.area}`, direction: "contractor_to_employer",
+    }, currentUser?.name).then((res) => {
+      if (res?.__error) console.error("ورود به گیت دوم (بازبینی کارفرما) شکست خورد:", res.message);
+    }).catch((err) => console.error("ورود به گیت دوم (بازبینی کارفرما) شکست خورد:", err));
+    await loadGateData();
     setPhotosMap((prev) => ({ ...prev, [a.id]: undefined }));
     setActionSaving(false);
     setExpandedId(null);
@@ -2549,9 +2616,14 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
     const patch = { status: "Closed", closeDate: todayISO() };
     await offlineWrite({ module: "anomalies", table: "anomalies", action: "update", id: a.id, payload: anomalyPatchToDb(patch) });
     setAnomalies(anomalies.map((x) => (x.id === a.id ? { ...x, ...patch, syncStatus: isOnline() ? "synced" : "pending" } : x)));
+    // تأیید مستقیم بدون عبور از گیت هم مجاز است (طبق خواسته‌ی صریح) — ولی
+    // اگر یک رکورد گیت باز برای همین مورد وجود دارد، همان‌جا هم بسته
+    // می‌شود تا تاریخچه‌ی گیت با وضعیت واقعی آنومالی ناهماهنگ نماند.
+    if (gateMap[a.id]) approveGateItem(gateMap[a.id].id, currentUser?.name).catch(() => {});
     setReviewSaving(false);
     setExpandedId(null);
     resetActionState();
+    await loadGateData();
   };
 
   const rejectAnomaly = async (a) => {
@@ -2560,9 +2632,11 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
     const patch = { status: "open", reviewNote: rejectNote.trim() };
     await offlineWrite({ module: "anomalies", table: "anomalies", action: "update", id: a.id, payload: anomalyPatchToDb(patch) });
     setAnomalies(anomalies.map((x) => (x.id === a.id ? { ...x, ...patch, syncStatus: isOnline() ? "synced" : "pending" } : x)));
+    if (gateMap[a.id]) rejectGateItem(gateMap[a.id].id, currentUser?.name, rejectNote.trim() || "رد و بازگشت به پیمانکار").catch(() => {});
     setReviewSaving(false);
     setExpandedId(null);
     resetActionState();
+    await loadGateData();
   };
 
   const riskMeta = (level) => RISK_LEVELS.find((r) => r.value === level) || RISK_LEVELS[1];
@@ -2625,8 +2699,16 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
     if (!gateItem) return;
     setGateBusy(a.id); setGateMessage("");
     const result = await approveGateItem(gateItem.id, currentUser?.name);
+    if (result?.__error) { setGateBusy(null); setGateMessage(result.message); return; }
+    // گیت دوم (اقدام اصلاحی پیمانکار → بازبینی کارفرما): «تأیید نهایی»
+    // یعنی خودِ آنومالی هم واقعاً بسته شود — برخلاف گیت اول که فقط دید
+    // پیمانکار را آزاد می‌کند و به تغییر وضعیت آنومالی نیازی ندارد.
+    if (gateItem.direction === "contractor_to_employer") {
+      const patch = { status: "Closed", closeDate: todayISO() };
+      await offlineWrite({ module: "anomalies", table: "anomalies", action: "update", id: a.id, payload: anomalyPatchToDb(patch) });
+      setAnomalies(anomalies.map((x) => (x.id === a.id ? { ...x, ...patch, syncStatus: isOnline() ? "synced" : "pending" } : x)));
+    }
     setGateBusy(null);
-    if (result?.__error) { setGateMessage(result.message); return; }
     await loadGateData();
   };
 
@@ -2635,8 +2717,15 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
     if (!gateItem) return;
     setGateBusy(a.id); setGateMessage("");
     const result = await rejectGateItem(gateItem.id, currentUser?.name, note);
+    if (result?.__error) { setGateBusy(null); setGateMessage(result.message); return; }
+    // گیت دوم: رد یعنی آنومالی به «باز» برمی‌گردد تا پیمانکار دوباره
+    // اقدام اصلاحی ثبت کند — دقیقاً همان رفتار rejectAnomaly.
+    if (gateItem.direction === "contractor_to_employer") {
+      const patch = { status: "open", reviewNote: note || "" };
+      await offlineWrite({ module: "anomalies", table: "anomalies", action: "update", id: a.id, payload: anomalyPatchToDb(patch) });
+      setAnomalies(anomalies.map((x) => (x.id === a.id ? { ...x, ...patch, syncStatus: isOnline() ? "synced" : "pending" } : x)));
+    }
     setGateBusy(null);
-    if (result?.__error) { setGateMessage(result.message); return; }
     await loadGateData();
   };
 
@@ -2934,26 +3023,28 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
                     <b>شرح اقدام پیمانکار:</b> {a.contractorAction}
                   </div>
                 )}
-                {!showRejectBox ? (
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button type="button" style={styles.button} onClick={() => approveAnomaly(a)} disabled={reviewSaving}>
-                      {reviewSaving ? "در حال ثبت..." : "تأیید و بستن"}
-                    </button>
-                    <button type="button" style={{ ...styles.smallButton, background: "#c92a2a" }} onClick={() => setShowRejectBox(true)}>
-                      رد و بازگشت
-                    </button>
-                  </div>
-                ) : (
-                  <>
-                    <label style={styles.label}>دلیل بازگشت (برای پیمانکار نمایش داده می‌شود)</label>
-                    <textarea style={{ ...styles.input, minHeight: 60, fontFamily: "inherit" }} value={rejectNote} onChange={(e) => setRejectNote(e.target.value)} dir="rtl" />
-                    <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                      <button type="button" style={{ ...styles.button, background: "#c92a2a" }} onClick={() => rejectAnomaly(a)} disabled={reviewSaving}>
-                        {reviewSaving ? "در حال ثبت..." : "تأیید بازگشت"}
+                {!gateMap[a.id] && (
+                  !showRejectBox ? (
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button type="button" style={styles.button} onClick={() => approveAnomaly(a)} disabled={reviewSaving}>
+                        {reviewSaving ? "در حال ثبت..." : "تأیید و بستن"}
                       </button>
-                      <button type="button" style={{ ...styles.smallButton, background: "#5b6b7d" }} onClick={() => setShowRejectBox(false)}>انصراف</button>
+                      <button type="button" style={{ ...styles.smallButton, background: "#c92a2a" }} onClick={() => setShowRejectBox(true)}>
+                        رد و بازگشت
+                      </button>
                     </div>
-                  </>
+                  ) : (
+                    <>
+                      <label style={styles.label}>دلیل بازگشت (برای پیمانکار نمایش داده می‌شود)</label>
+                      <textarea style={{ ...styles.input, minHeight: 60, fontFamily: "inherit" }} value={rejectNote} onChange={(e) => setRejectNote(e.target.value)} dir="rtl" />
+                      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                        <button type="button" style={{ ...styles.button, background: "#c92a2a" }} onClick={() => rejectAnomaly(a)} disabled={reviewSaving}>
+                          {reviewSaving ? "در حال ثبت..." : "تأیید بازگشت"}
+                        </button>
+                        <button type="button" style={{ ...styles.smallButton, background: "#5b6b7d" }} onClick={() => setShowRejectBox(false)}>انصراف</button>
+                      </div>
+                    </>
+                  )
                 )}
               </div>
             )}
@@ -2981,7 +3072,7 @@ function AnomalyList({ onBack, role, currentUser, readOnly, initialStatusFilter,
                   <div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
                       <button type="button" style={{ ...styles.smallButton, background: "#166534" }} onClick={() => handleApproveGate(a)} disabled={gateBusy === a.id}>
-                        تأیید نهایی و ارسال به پیمانکار
+                        {gateMap[a.id].direction === "contractor_to_employer" ? "تأیید نهایی و بستن آنومالی" : "تأیید نهایی و ارسال به پیمانکار"}
                       </button>
                       {gateMap[a.id].status === "pending_approval" && (
                         <button type="button" style={styles.smallButton} onClick={() => { setAssigningGateId(a.id); setAssignGateTo(""); }} disabled={gateBusy === a.id}>
@@ -4386,12 +4477,23 @@ function AppInner() {
   // گیت بیومتریک رد می‌شود.
   const [biometricUnlocked, setBiometricUnlocked] = useState(false);
 
-  // متغیر ماژولی «شرکت فعلی» با رفرش صفحه پاک می‌شود؛ ولی currentUser از
-  // localStorage بازیابی می‌شود، پس همین‌جا دوباره تنظیمش می‌کنیم. همچنین
-  // موقع خروج باید صفر شود، وگرنه ورود بعدی (حتی برای شرکت دیگر) با زمینه‌ی
-  // شرکت قبلی فیلتر می‌شود و شکست می‌خورد.
+  // «شرکت فعلی» باید قبل از رندرشدن هر فرزندی (مثل SubscriptionGate که
+  // بلافاصله در اولین افکتش این مقدار را می‌خواند) درست باشد — برای
+  // همین اینجا مستقیم در بدنه‌ی رندر صدا زده می‌شود، نه داخل useEffect
+  // (که در React بعد از افکت‌های فرزندان اجرا می‌شود و همان race
+  // condition ای بود که باعث می‌شد بعد از رفرش صفحه، حتی یک Trial کاملاً
+  // معتبر هم به‌اشتباه به صفحه‌ی خرید پلن فرستاده شود).
+  {
+    const companyId = currentUser ? currentUser.companyId || null : null;
+    if (getCurrentCompanyId() !== companyId) setCurrentCompanyId(companyId);
+  }
+
+  // کش محلی دستگاه هم با شرکت هماهنگ می‌شود — این بخش همچنان می‌تواند
+  // داخل useEffect بماند چون خودش async است و فقط پاک‌سازی کش قدیمی
+  // احتمالی را انجام می‌دهد، نه تشخیص وضعیت اشتراک را.
   useEffect(() => {
-    setCurrentCompanyId(currentUser ? currentUser.companyId || null : null);
+    const companyId = currentUser ? currentUser.companyId || null : null;
+    syncOfflineCacheCompanyScope(companyId).catch(() => {});
   }, [currentUser]);
 
   // ورود تازه و صریح با رمز عبور، خودش یک احراز هویت کامل است — نیازی
@@ -4402,6 +4504,15 @@ function AppInner() {
   const handleLogin = (user) => {
     setBiometricUnlocked(true);
     setCurrentUser(user);
+    // طبق خواسته‌ی صریح: با هر ورود تازه (نه رفرش صفحه)، کاربر باید از
+    // صفحه‌ی اصلی شروع کند — نه جایی که کاربر قبلی (با همان نقش) رهایش
+    // کرده بود. این سه کلید بر اساس نقش ذخیره می‌شوند نه کاربر، پس اینجا
+    // (لحظه‌ی ورود واقعی، نه بازیابی نشست از localStorage) پاک می‌شوند.
+    try {
+      localStorage.removeItem("ihms_view_admin");
+      localStorage.removeItem("ihms_view_employer");
+      localStorage.removeItem("ihms_view_contractor");
+    } catch { /* بی‌اهمیت اگر localStorage در دسترس نبود */ }
   };
 
   // خروج کامل: طبق الزام صریح، باید اعتبار ورود بیومتریک را هم باطل کند
